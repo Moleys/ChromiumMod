@@ -97,12 +97,8 @@ jobs:
         Set-Content -Path "v8\src\inspector\v8-console-message.h" -Value $headerContent
 
         $sourceContent = Get-Content "v8\src\inspector\v8-console-message.cc" -Raw
-        $sourceContent = $sourceContent -replace 'void V8ConsoleMessageStorage::addMessage\(\s*std::unique_ptr<V8ConsoleMessage> message\) \{', @'
-void V8ConsoleMessageStorage::addMessage(
-    std::unique_ptr<V8ConsoleMessage> message, bool isOutputToDevTools) {
-  // Default behavior: don't output to DevTools
-  if (!isOutputToDevTools) return;
-'@
+        $replacement = "void V8ConsoleMessageStorage::addMessage(`r`n    std::unique_ptr<V8ConsoleMessage> message, bool isOutputToDevTools) {`r`n  // Default behavior: don't output to DevTools`r`n  if (!isOutputToDevTools) return;"
+        $sourceContent = $sourceContent -replace 'void V8ConsoleMessageStorage::addMessage\(\s*std::unique_ptr<V8ConsoleMessage> message\) \{', $replacement
         Set-Content -Path "v8\src\inspector\v8-console-message.cc" -Value $sourceContent
 
     - name: Apply Debugger 2.0 modifications
@@ -130,18 +126,12 @@ void V8ConsoleMessageStorage::addMessage(
         $parserContent = Get-Content "v8\src\parsing\parser-base.h" -Raw
         if ($parserContent -notmatch "kDebugPoint") {
           # Add debugpoint case
-          $parserContent = $parserContent -replace '(case Token::kDebugger:\s*return ParseDebuggerStatement\(\);)', @'
-case Token::kDebugger:
-      return ParseDebuggerStatement();
-    case Token::kDebugPoint:
-      return ParseDebugPointStatement();
-'@
+          $debuggerReplacement = "case Token::kDebugger:`r`n      return ParseDebuggerStatement();`r`n    case Token::kDebugPoint:`r`n      return ParseDebugPointStatement();"
+          $parserContent = $parserContent -replace '(case Token::kDebugger:\s*return ParseDebuggerStatement\(\);)', $debuggerReplacement
 
           # Add ParseDebugPointStatement declaration
-          $parserContent = $parserContent -replace '(StatementT ParseDebuggerStatement\(\);)', @'
-StatementT ParseDebuggerStatement();
-  StatementT ParseDebugPointStatement();
-'@
+          $declarationReplacement = "StatementT ParseDebuggerStatement();`r`n  StatementT ParseDebugPointStatement();"
+          $parserContent = $parserContent -replace '(StatementT ParseDebuggerStatement\(\);)', $declarationReplacement
 
           Set-Content -Path "v8\src\parsing\parser-base.h" -Value $parserContent
         }
@@ -165,7 +155,7 @@ StatementT ParseDebuggerStatement();
         cd C:\chromium\src
 
         # Generate build configuration for Release
-        gn gen out\Release --args="is_debug=false is_component_build=false is_official_build=true proprietary_codecs=true ffmpeg_branding=`"Chrome`" target_cpu=`"x64`" symbol_level=0 dcheck_always_on=false enable_nacl=false use_jumbo_build=true"
+        gn gen out\Release --args='is_debug=false is_component_build=false is_official_build=true proprietary_codecs=true ffmpeg_branding="Chrome" target_cpu="x64" symbol_level=0 dcheck_always_on=false enable_nacl=false use_jumbo_build=true'
 
         # If Debug build is requested
         if ("${{ matrix.build_type }}" -eq "Debug") {
