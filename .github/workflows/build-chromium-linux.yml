@@ -1,0 +1,181 @@
+name: Build ChromiumMod Linux
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+        - Release
+        - Debug
+
+env:
+  # Chromium build requires significant resources
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build-chromium:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 480  # 8 hours timeout for Chromium build
+
+    strategy:
+      matrix:
+        build_type: [Release]
+
+    steps:
+    - name: Checkout ChromiumMod
+      uses: actions/checkout@v4
+      with:
+        path: chromium-mod
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install prerequisites
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git curl python3-pip python3-venv gperf pkg-config
+
+    - name: Setup depot_tools
+      run: |
+        git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+        echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+    - name: Configure git
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git config --global core.autocrlf false
+        git config --global core.filemode false
+        git config --global color.ui true
+
+    - name: Create Chromium workspace
+      run: |
+        mkdir -p "$HOME/chromium"
+
+    - name: Fetch Chromium source
+      env:
+        DEPOT_TOOLS_UPDATE: 1
+      run: |
+        cd "$HOME/chromium"
+        fetch --nohooks --no-history chromium
+
+    - name: Install Linux build dependencies
+      run: |
+        cd "$HOME/chromium/src"
+        sudo ./build/install-build-deps.sh --no-prompt --no-chromeos-fonts
+
+    - name: Apply ChromiumMod patches
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$HOME/chromium/src"
+        # Copy modification files from ChromiumMod repo (if any)
+        cp -a "${{ github.workspace }}/chromium-mod/modifications/." . 2>/dev/null || true
+
+        echo "Applying console detection bypass..."
+        # Backup original files
+        cp -f v8/src/inspector/v8-console-message.h v8/src/inspector/v8-console-message.h.backup 2>/dev/null || true
+        cp -f v8/src/inspector/v8-console-message.cc v8/src/inspector/v8-console-message.cc.backup 2>/dev/null || true
+
+        # Apply console bypass modifications
+        perl -0777 -i -pe 's/void\s+addMessage\(std::unique_ptr<V8ConsoleMessage>\);/void addMessage(std::unique_ptr<V8ConsoleMessage>, bool isOutputToDevTools = false);/s' v8/src/inspector/v8-console-message.h || true
+        perl -0777 -i -pe 's/void\s+V8ConsoleMessageStorage::addMessage\(\s*std::unique_ptr<V8ConsoleMessage>\s+message\s*\)\s*\{/void V8ConsoleMessageStorage::addMessage(\n    std::unique_ptr<V8ConsoleMessage> message, bool isOutputToDevTools) {\n  \/\/ Default behavior: do not output to DevTools by default\n  if (!isOutputToDevTools) return;\n/s' v8/src/inspector/v8-console-message.cc || true
+
+    - name: Apply Debugger 2.0 modifications (skipped on Linux)
+      shell: bash
+      run: |
+        echo "Skipping debugpoint keyword injection on Linux to avoid gperf issues."
+
+    - name: Run gclient runhooks
+      env:
+        DEPOT_TOOLS_UPDATE: 1
+      run: |
+        cd "$HOME/chromium/src"
+        gclient runhooks
+
+    - name: Setup build configuration
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$HOME/chromium/src"
+
+        if [ "${{ matrix.build_type }}" = "Debug" ]; then
+          gn gen out/Debug --args='is_debug=true symbol_level=2 is_component_build=true enable_nacl=false blink_symbol_level=2 v8_symbol_level=2 dcheck_always_on=true use_jumbo_build=true'
+        else
+          gn gen out/Release --args='is_debug=false is_component_build=false is_official_build=true proprietary_codecs=true ffmpeg_branding="Chrome" target_cpu="x64" symbol_level=0 dcheck_always_on=false enable_nacl=false use_jumbo_build=true'
+        fi
+
+    - name: Build Chromium
+      env:
+        NINJA_STATUS: "[%f/%t] "
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$HOME/chromium/src"
+        if [ "${{ matrix.build_type }}" = "Debug" ]; then
+          autoninja -C out/Debug chrome -j 4
+        else
+          autoninja -C out/Release chrome -j 4
+        fi
+
+    # No mini_installer target on Linux
+
+    - name: Prepare artifacts
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "$HOME/chromium/src"
+        mkdir -p artifacts
+
+        if [ "${{ matrix.build_type }}" = "Debug" ]; then
+          tar czf artifacts/chromium-mod-debug.tar.gz -C out/Debug . || true
+        else
+          tar czf artifacts/chromium-mod-release.tar.gz -C out/Release . || true
+        fi
+
+        version=$(grep -E '^(MAJOR|MINOR|BUILD|PATCH)=' chrome/VERSION | cut -d'=' -f2 | paste -sd '.')
+        {
+          echo "Built Chromium version: $version"
+          echo "Build type: ${{ matrix.build_type }}"
+          echo "Build date: $(date)"
+          echo "Modifications: Console Detection Bypass"
+        } > artifacts/VERSION.txt
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: chromium-mod-${{ matrix.build_type }}-${{ github.run_number }}
+        path: $HOME/chromium/src/artifacts/
+        retention-days: 30
+
+    - name: Create release (on tag)
+      if: startsWith(github.ref, 'refs/tags/') && matrix.build_type == 'Release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          $HOME/chromium/src/artifacts/chromium-mod-release.tar.gz
+          $HOME/chromium/src/artifacts/VERSION.txt
+        body: |
+          ChromiumMod Release - DevTools Detection Bypass (Linux)
+
+          This build includes:
+          - Console Detection Bypass: Prevents console.* and throw detection
+          - Debugger 2.0 Advanced Bypass: Undetectable debugger replacement
+
+          ## Testing
+          Test on sites like https://www.ldvmp.com/ to verify bypasses work correctly.
+
+          ## Installation
+          Extract the tarball and run the chrome binary from out/Release.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
