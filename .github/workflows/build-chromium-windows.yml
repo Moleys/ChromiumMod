@@ -1,0 +1,249 @@
+name: Build ChromiumMod Windows
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+        - Release
+        - Debug
+
+env:
+  # Chromium build requires significant resources
+  DEPOT_TOOLS_WIN_TOOLCHAIN: 0
+  GYP_MSVS_VERSION: 2022
+
+jobs:
+  build-chromium:
+    runs-on: windows-2022
+    timeout-minutes: 480  # 8 hours timeout for Chromium build
+
+    strategy:
+      matrix:
+        build_type: [Release]
+
+    steps:
+    - name: Checkout ChromiumMod
+      uses: actions/checkout@v4
+      with:
+        path: chromium-mod
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Free up disk space
+      run: |
+        # Remove unnecessary software to free up space
+        Get-ChildItem "C:\Program Files" | Where-Object { $_.Name -match "Microsoft Visual Studio|Android|Docker" -and $_.Name -notmatch "2022" } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem "C:\Program Files (x86)" | Where-Object { $_.Name -match "Microsoft Visual Studio|Android" } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        # Clean temp files
+        Remove-Item -Path "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+
+    - name: Setup depot_tools
+      run: |
+        # Clone depot_tools
+        git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
+        # Add to PATH
+        echo "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+    - name: Configure git
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git config --global core.autocrlf false
+        git config --global core.filemode false
+        git config --global color.ui true
+
+    - name: Create Chromium workspace
+      run: |
+        mkdir C:\chromium
+        cd C:\chromium
+
+    - name: Fetch Chromium source
+      run: |
+        cd C:\chromium
+        # Fetch Chromium source without hooks initially
+        fetch --nohooks --no-history chromium
+      env:
+        DEPOT_TOOLS_UPDATE: 1
+
+    - name: Apply ChromiumMod patches
+      run: |
+        cd C:\chromium\src
+
+        # Copy modification files from ChromiumMod repo
+        Copy-Item -Path "${{ github.workspace }}\chromium-mod\modifications\*" -Destination "." -Recurse -Force -ErrorAction SilentlyContinue
+
+        # Apply Console Detection Bypass
+        echo "Applying console detection bypass..."
+
+        # Backup original files
+        Copy-Item -Path "v8\src\inspector\v8-console-message.h" -Destination "v8\src\inspector\v8-console-message.h.backup" -ErrorAction SilentlyContinue
+        Copy-Item -Path "v8\src\inspector\v8-console-message.cc" -Destination "v8\src\inspector\v8-console-message.cc.backup" -ErrorAction SilentlyContinue
+
+        # Apply console bypass modifications
+        $headerContent = Get-Content "v8\src\inspector\v8-console-message.h" -Raw
+        $headerContent = $headerContent -replace 'void addMessage\(std::unique_ptr<V8ConsoleMessage>\);', 'void addMessage(std::unique_ptr<V8ConsoleMessage>, bool isOutputToDevTools = false);'
+        Set-Content -Path "v8\src\inspector\v8-console-message.h" -Value $headerContent
+
+        $sourceContent = Get-Content "v8\src\inspector\v8-console-message.cc" -Raw
+        $sourceContent = $sourceContent -replace 'void V8ConsoleMessageStorage::addMessage\(\s*std::unique_ptr<V8ConsoleMessage> message\) \{', @'
+void V8ConsoleMessageStorage::addMessage(
+    std::unique_ptr<V8ConsoleMessage> message, bool isOutputToDevTools) {
+  // Default behavior: don't output to DevTools
+  if (!isOutputToDevTools) return;
+'@
+        Set-Content -Path "v8\src\inspector\v8-console-message.cc" -Value $sourceContent
+
+    - name: Apply Debugger 2.0 modifications
+      run: |
+        cd C:\chromium\src
+
+        echo "Applying debugger 2.0 bypass..."
+
+        # Apply debugger keyword modifications
+        # Add debugpoint keyword to keywords.txt
+        $keywordsContent = Get-Content "v8\src\parsing\keywords.txt" -Raw
+        if ($keywordsContent -notmatch "debugpoint") {
+          $keywordsContent = $keywordsContent -replace '(debugger, Token::kDebugger)', "debugger, Token::kDebugger`r`ndebugpoint, Token::kDebugPoint"
+          Set-Content -Path "v8\src\parsing\keywords.txt" -Value $keywordsContent
+        }
+
+        # Add token definition
+        $tokenContent = Get-Content "v8\src\parsing\token.h" -Raw
+        if ($tokenContent -notmatch "kDebugPoint") {
+          $tokenContent = $tokenContent -replace '(K\(kDebugger, "debugger", 0\))', "K(kDebugger, `"debugger`", 0) \`r`nK(kDebugPoint, `"debugpoint`", 0)"
+          Set-Content -Path "v8\src\parsing\token.h" -Value $tokenContent
+        }
+
+        # Modify parser-base.h for debugpoint handling
+        $parserContent = Get-Content "v8\src\parsing\parser-base.h" -Raw
+        if ($parserContent -notmatch "kDebugPoint") {
+          # Add debugpoint case
+          $parserContent = $parserContent -replace '(case Token::kDebugger:\s*return ParseDebuggerStatement\(\);)', @'
+case Token::kDebugger:
+      return ParseDebuggerStatement();
+    case Token::kDebugPoint:
+      return ParseDebugPointStatement();
+'@
+
+          # Add ParseDebugPointStatement declaration
+          $parserContent = $parserContent -replace '(StatementT ParseDebuggerStatement\(\);)', @'
+StatementT ParseDebuggerStatement();
+  StatementT ParseDebugPointStatement();
+'@
+
+          Set-Content -Path "v8\src\parsing\parser-base.h" -Value $parserContent
+        }
+
+        # Regenerate keywords if needed
+        if (Test-Path "v8\tools\gen-keywords-gen-h.py") {
+          cd v8
+          python tools\gen-keywords-gen-h.py
+          cd ..
+        }
+
+    - name: Run gclient runhooks
+      run: |
+        cd C:\chromium\src
+        gclient runhooks
+      env:
+        DEPOT_TOOLS_UPDATE: 1
+
+    - name: Setup build configuration
+      run: |
+        cd C:\chromium\src
+
+        # Generate build configuration for Release
+        gn gen out\Release --args="is_debug=false is_component_build=false is_official_build=true proprietary_codecs=true ffmpeg_branding=`"Chrome`" target_cpu=`"x64`" symbol_level=0 dcheck_always_on=false enable_nacl=false use_jumbo_build=true"
+
+        # If Debug build is requested
+        if ("${{ matrix.build_type }}" -eq "Debug") {
+          gn gen out\Debug --args="is_debug=true symbol_level=2 is_component_build=true enable_nacl=false blink_symbol_level=2 v8_symbol_level=2 dcheck_always_on=true"
+        }
+
+    - name: Build Chromium
+      run: |
+        cd C:\chromium\src
+
+        # Build Chrome with limited parallelism to avoid memory issues
+        if ("${{ matrix.build_type }}" -eq "Debug") {
+          autoninja -C out\Debug chrome -j 2
+        } else {
+          autoninja -C out\Release chrome -j 2
+        }
+      env:
+        # Limit memory usage
+        NINJA_STATUS: "[%f/%t] "
+
+    - name: Build mini_installer (Release only)
+      if: matrix.build_type == 'Release'
+      run: |
+        cd C:\chromium\src
+        autoninja -C out\Release mini_installer -j 2
+
+    - name: Prepare artifacts
+      run: |
+        cd C:\chromium\src
+
+        # Create artifacts directory
+        mkdir artifacts -ErrorAction SilentlyContinue
+
+        if ("${{ matrix.build_type }}" -eq "Debug") {
+          # Copy Debug build
+          Copy-Item -Path "out\Debug\chrome.exe" -Destination "artifacts\chromium-mod-debug.exe" -ErrorAction SilentlyContinue
+          # Copy necessary DLLs for Debug build
+          Get-ChildItem "out\Debug\*.dll" | ForEach-Object { Copy-Item $_.FullName "artifacts\" -ErrorAction SilentlyContinue }
+        } else {
+          # Copy Release build
+          Copy-Item -Path "out\Release\chrome.exe" -Destination "artifacts\chromium-mod-release.exe" -ErrorAction SilentlyContinue
+          # Copy installer if exists
+          Copy-Item -Path "out\Release\mini_installer.exe" -Destination "artifacts\chromium-mod-installer.exe" -ErrorAction SilentlyContinue
+        }
+
+        # Create version info
+        $version = (Get-Content "chrome\VERSION" | Select-String "MAJOR|MINOR|BUILD|PATCH") -join "."
+        echo "Built Chromium version: $version" | Out-File -FilePath "artifacts\VERSION.txt"
+        echo "Build type: ${{ matrix.build_type }}" | Out-File -FilePath "artifacts\VERSION.txt" -Append
+        echo "Build date: $(Get-Date)" | Out-File -FilePath "artifacts\VERSION.txt" -Append
+        echo "Modifications: Console Detection Bypass + Debugger 2.0 Advanced Bypass" | Out-File -FilePath "artifacts\VERSION.txt" -Append
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: chromium-mod-${{ matrix.build_type }}-${{ github.run_number }}
+        path: C:\chromium\src\artifacts\
+        retention-days: 30
+
+    - name: Create release (on tag)
+      if: startsWith(github.ref, 'refs/tags/') && matrix.build_type == 'Release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          C:\chromium\src\artifacts\chromium-mod-release.exe
+          C:\chromium\src\artifacts\chromium-mod-installer.exe
+          C:\chromium\src\artifacts\VERSION.txt
+        body: |
+          ChromiumMod Release - DevTools Detection Bypass
+
+          This build includes:
+          - Console Detection Bypass: Prevents console.* and throw detection
+          - Debugger 2.0 Advanced Bypass: Undetectable debugger replacement
+
+          ## Testing
+          Test on sites like https://www.ldvmp.com/ to verify bypasses work correctly.
+
+          ## Installation
+          Use chromium-mod-installer.exe for easy installation or run chromium-mod-release.exe directly.
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
