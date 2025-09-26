@@ -101,6 +101,14 @@ jobs:
         $sourceContent = $sourceContent -replace 'void V8ConsoleMessageStorage::addMessage\(\s*std::unique_ptr<V8ConsoleMessage> message\) \{', $replacement
         Set-Content -Path "v8\src\inspector\v8-console-message.cc" -Value $sourceContent
 
+    - name: Install gperf (required by V8 generator)
+      run: |
+        choco install -y gperf
+        # Verify gperf is available on PATH
+        $g = Get-Command gperf -ErrorAction SilentlyContinue
+        if (-not $g) { Write-Error "gperf not found after installation"; exit 1 }
+        gperf --version
+
     - name: Apply Debugger 2.0 modifications
       run: |
         cd C:\chromium\src
